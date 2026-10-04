@@ -47,6 +47,7 @@ function renderError(err) {
 }
 
 function renderOk(r) {
+  const fmtRanges = (ranges) => ranges.map(([s, e]) => `[${s}, ${e})`).join(' ');
   const rows = r.commands.map((c) => `
     <tr>
       <td class="mono">${c.index + 1}</td>
@@ -54,8 +55,12 @@ function renderOk(r) {
       <td class="mono">${c.length}</td>
       <td class="mono">[${c.byteRange[0]}, ${c.byteRange[1]})</td>
       <td class="mono">[${c.payloadRange[0]}, ${c.payloadRange[1]})</td>
-      <td class="mono pkt-list">${c.packets.map((p) => `#${p}`).join(', ')}</td>
+      <td class="mono pkt-list">${c.sources.map((src) =>
+    `#${src.packet} <span class="ranges">${fmtRanges(src.ranges)}</span>`).join('<br>')}</td>
     </tr>`).join('');
+  // 全流审计表：每个原始包实际承载的流内半开区间（重叠区间会在不同包下各出现一次）
+  const coverageRows = (r.packetCoverage || []).map((p) => `
+    <tr><td class="mono">#${p.packet}</td><td class="mono">${fmtRanges(p.ranges)}</td></tr>`).join('');
   resultEl.innerHTML = `
     <div class="banner ok">
       <div>✓ 复核通过：已按序重建 ${r.commands.length} 条长度前缀 ASCII 指令（FIN 前连续字节，无空洞、无冲突）</div>
@@ -72,10 +77,15 @@ function renderOk(r) {
           <th>#</th><th>重建指令（ASCII）</th><th>载荷长度</th>
           <th class="mono">流内字节区间[起,止)<br><span style="font-weight:400">含 2 字节长度前缀</span></th>
           <th class="mono">载荷区间[起,止)</th>
-          <th>对应原始包号</th>
+          <th>原始包号 → 该包实际承载的流内半开区间</th>
         </tr>
       </thead>
       <tbody>${rows}</tbody>
+    </table>
+    <h3 style="margin:1rem 0 .5rem">原始包承载审计（流内半开区间）</h3>
+    <table class="coverage-table">
+      <thead><tr><th>原始包号</th><th>实际承载区间[起,止)</th></tr></thead>
+      <tbody>${coverageRows}</tbody>
     </table>`;
   resultEl.className = 'card';
 }
@@ -118,7 +128,7 @@ async function loadSample(kind) {
   try {
     const [m, b] = await Promise.all([
       fetch('/samples/manifest.json').then((r) => r.json()),
-      fetch(`/samples/${kind === 'good' ? 'good' : 'conflict'}.pcap.b64`).then((r) => r.text()),
+      fetch(`/samples/${kind}.pcap.b64`).then((r) => r.text()),
     ]);
     $('srcIp').value = m.tuple.srcIp;
     $('srcPort').value = m.tuple.srcPort;
@@ -132,5 +142,6 @@ async function loadSample(kind) {
 }
 document.getElementById('btn-sample-good').addEventListener('click', () => loadSample('good'));
 document.getElementById('btn-sample-conflict').addEventListener('click', () => loadSample('conflict'));
+document.getElementById('btn-sample-fragconflict').addEventListener('click', () => loadSample('fragconflict'));
 
 updateMeter();

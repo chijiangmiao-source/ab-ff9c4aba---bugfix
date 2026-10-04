@@ -109,6 +109,9 @@ th { color: var(--muted); font-weight: 600; font-size: 12px; }
 td.mono, th.mono { font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; }
 .cmd-text { color: #b8f2d2; }
 .pkt-list { color: #9fc4ff; }
+.pkt-list .ranges { color: var(--muted); }
+.coverage-table { max-width: 420px; }
+.coverage-table td:last-child { color: var(--muted); }
 footer {
   text-align: center;
   color: var(--muted);

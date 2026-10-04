@@ -179,6 +179,86 @@ const req = (buf, extra = {}) => ({ ...T, pcapBase64: b64(buf), ...extra });
     () => analyze(req(pcap([s.syn(), syn2, s.data(0, 3), s.fin(3)]))), 'CONFLICT');
 }
 
+// ---------- 4d. 跨多片乱序数据报的逐字节来源 / 相同内容重叠分片 / 冲突分片 ----------
+{
+  // 3 条指令：[0,7) CMD-A，[7,15) CMD-BB，[15,24) CMD-CCC
+  const s = makeSession({ isn: 0x2000, id: 0x7100, commands: ['CMD-A', 'CMD-BB', 'CMD-CCC'] });
+  const seg = s.tcpSegment(0, 24);          // 20 字节 TCP 头 + 24 字节流 = 44 字节 IP 载荷
+  const frags = [];
+  for (let off = 0; off < seg.length; off += 8) {
+    const n = Math.min(8, seg.length - off);
+    frags.push(s.ipFrag(seg.subarray(off, off + n), off / 8, off + n < seg.length));
+  }
+  // 流偏移映射：frag2→[0,4) frag3→[4,12) frag4→[12,20) frag5→[20,24)（frag0/1 只盖 TCP 头）
+  // 乱序到达 [3,0,5,2,4,1]：#2=frag3 #3=frag0 #4=frag5 #5=frag2 #6=frag4 #7=frag1
+  const order = [3, 0, 5, 2, 4, 1];
+  const shuffled = order.map((i) => frags[i]);
+  const r = analyze(req(pcap([s.syn(), ...shuffled, s.fin(24)])));
+  eq('来源: 乱序跨片重建指令文本', r.commands.map((c) => c.text), ['CMD-A', 'CMD-BB', 'CMD-CCC']);
+  eq('来源: 指令一（前缀/载荷分属不同真实分片）',
+    r.commands[0].sources, [
+      { packet: 2, ranges: [[4, 7]] },   // frag3：载荷 [4,7)
+      { packet: 5, ranges: [[0, 4]] },   // frag2：2 字节前缀 [0,2)+载荷 [2,4)
+    ]);
+  eq('来源: 指令二（首尾跨两片）',
+    r.commands[1].sources, [
+      { packet: 2, ranges: [[7, 12]] },  // frag3
+      { packet: 6, ranges: [[12, 15]] }, // frag4
+    ]);
+  eq('来源: 后续指令三归属到末两片',
+    r.commands[2].sources, [
+      { packet: 4, ranges: [[20, 24]] }, // frag5（先到的末片）
+      { packet: 6, ranges: [[15, 20]] },// frag4
+    ]);
+  eq('来源: 仅承载 TCP 头的分片不冒领任何流字节',
+    r.packetCoverage, [
+      { packet: 2, ranges: [[4, 12]] }, { packet: 4, ranges: [[20, 24]] },
+      { packet: 5, ranges: [[0, 4]] }, { packet: 6, ranges: [[12, 20]] },
+    ]);
+
+  // 加入与 frag3/frag4 重叠、但内容逐字节相同的有效分片（IP off=3，承载流 [4,20)）
+  const dupPart = Buffer.from(seg.subarray(24, 40));
+  const dup = s.ipFrag(dupPart, 3, true); // #8
+  const r2 = analyze(req(pcap([s.syn(), ...shuffled, dup, s.fin(24)])));
+  eq('重叠: 相同内容重叠分片后结论仍通过', r2.commands.map((c) => c.text),
+    ['CMD-A', 'CMD-BB', 'CMD-CCC']);
+  eq('重叠: 指令一保留新片与原片两份凭据',
+    r2.commands[0].sources, [
+      { packet: 2, ranges: [[4, 7]] }, { packet: 5, ranges: [[0, 4]] },
+      { packet: 8, ranges: [[4, 7]] },
+    ]);
+  eq('重叠: 指令二整段由两份重叠凭据共同承载',
+    r2.commands[1].sources, [
+      { packet: 2, ranges: [[7, 12]] }, { packet: 6, ranges: [[12, 15]] },
+      { packet: 8, ranges: [[7, 15]] },
+    ]);
+  eq('重叠: 指令三也保留新片对 [15,20) 的凭据',
+    r2.commands[2].sources, [
+      { packet: 4, ranges: [[20, 24]] }, { packet: 6, ranges: [[15, 20]] },
+      { packet: 8, ranges: [[15, 20]] },
+    ]);
+
+  // 同一额外分片但把数据报偏移 28（流内 8）处字节改坏 → 与 frag3(#2) 冲突
+  const evilPart = Buffer.from(seg.subarray(24, 40));
+  evilPart[4] ^= 0x5a;
+  const evil = s.ipFrag(evilPart, 3, true);
+  try {
+    analyze(req(pcap([s.syn(), ...shuffled, evil, s.fin(24)])));
+    ok('重叠: 重叠字节不同必须拒绝', false);
+  } catch (e) {
+    ok('重叠: 重叠字节不同必须拒绝', e.code === 'FRAGMENT_CONFLICT', e.message);
+    eq('重叠: 冲突定位两个原始包号', [e.packet, e.packet2], [2, 8]);
+    eq('重叠: 冲突定位数据报内偏移与区间', [e.offset, ...e.range], [28, 28, 29]);
+  }
+
+  // 缺末片 → 不得输出结论（MISSING_FRAGMENT）
+  expectCode('来源: 缺末片拒绝',
+    () => analyze(req(pcap([s.syn(), ...frags.slice(0, 5)]))), 'MISSING_FRAGMENT');
+  // FIN 提前到 23：第三条指令声明 7 字节载荷但流被截断 → TRUNCATED_COMMAND
+  expectCode('来源: 末条指令不完整拒绝',
+    () => analyze(req(pcap([s.syn(), ...shuffled, s.fin(23)]))), 'TRUNCATED_COMMAND');
+}
+
 // ---------- 5. TCP 重组 ----------
 {
   const s = makeSession({ commands: ['AAA', 'BBBB', 'CCCCC'] }); // 5+6+7 = 18 字节
@@ -342,7 +422,7 @@ const req = (buf, extra = {}) => ({ ...T, pcapBase64: b64(buf), ...extra });
   }
   // 页面与同构库必须是语法合法的 ESM（node --check）
   for (const f of ['public/app.js', 'lib/analyze.js', 'lib/tcp.js', 'lib/ipdefrag.js',
-    'lib/decode.js', 'lib/commands.js', 'lib/base64.js', 'src/server.js']) {
+    'lib/decode.js', 'lib/commands.js', 'lib/coverage.js', 'lib/base64.js', 'src/server.js']) {
     try {
       execFileSync(process.execPath, ['--check', path.join(ROOT, f)], { stdio: 'pipe' });
       ok(`页面: ESM 语法检查 ${f}`, true);
@@ -352,7 +432,7 @@ const req = (buf, extra = {}) => ({ ...T, pcapBase64: b64(buf), ...extra });
   }
   // 关键交互元素齐备
   for (const id of ['srcIp', 'srcPort', 'dstIp', 'dstPort', 'pcap', 'btn-verify', 'btn-clear',
-    'btn-sample-good', 'btn-sample-conflict', 'result']) {
+    'btn-sample-good', 'btn-sample-conflict', 'btn-sample-fragconflict', 'result']) {
     ok(`页面: 控件 #${id}`, html.includes(`id="${id}"`));
   }
 }
@@ -384,7 +464,6 @@ const req = (buf, extra = {}) => ({ ...T, pcapBase64: b64(buf), ...extra });
     throw new Error(`server at ${base} never became ready`);
   }
 
-  let smokeOk = 0;
   try {
     await waitReady();
     const h = await fetch(`${base}/healthz`);
@@ -403,28 +482,52 @@ const req = (buf, extra = {}) => ({ ...T, pcapBase64: b64(buf), ...extra });
 
     // 本题样例经 HTTP 拉取并端到端复核
     const manifest = JSON.parse(await (await fetch(`${base}/samples/manifest.json`)).text());
-    for (const kind of ['good', 'conflict']) {
-      const spec = manifest[kind];
+    const analyzeFromHttp = async (spec) => {
       const b64Text = (await (await fetch(`${base}/samples/${spec.file}`)).text()).replace(/\s/g, '');
-      const input = { ...manifest.tuple, pcapBase64: b64Text };
-      if (kind === 'good') {
-        const r = analyze(input);
-        smokeOk += r.commands.length === spec.commands.length
-          && r.commands.every((c, i) => c.text === spec.commands[i].text)
-          && r.synPacket === spec.synPacket && r.finPacket === spec.finPacket
-          && r.streamLength === spec.streamLength && r.packetCount === spec.packetCount;
-        ok('冒烟: good 样例指令/包号/长度全部符合', smokeOk === 1,
-          JSON.stringify(r.commands.map((c) => c.text)));
-      } else {
-        try {
-          analyze(input);
-          ok('冒烟: conflict 样例必须拒绝', false);
-        } catch (e) {
-          ok('冒烟: conflict 样例 CONFLICT 定位符合',
-            e.code === spec.code && e.packet === spec.packet && e.packet2 === spec.packet2
-            && e.offset === spec.offset && JSON.stringify(e.range) === JSON.stringify(spec.range),
-            `${e.code} ${e.packet}/${e.packet2}@${e.offset}`);
-        }
+      return analyze({ ...manifest.tuple, pcapBase64: b64Text });
+    };
+
+    // good：指令文本/流内区间/每包实际承载区间（含相同内容重叠分片的双份凭据）
+    {
+      const spec = manifest.good;
+      const r = await analyzeFromHttp(spec);
+      const sameJson = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+      ok('冒烟: good 指令文本/数量',
+        r.commands.length === spec.commands.length
+          && r.commands.every((c, i) => c.text === spec.commands[i].text
+            && sameJson(c.byteRange, spec.commands[i].byteRange)
+            && sameJson(c.payloadRange, spec.commands[i].payloadRange)),
+        JSON.stringify(r.commands.map((c) => [c.text, c.byteRange, c.payloadRange])));
+      ok('冒烟: good 每条指令的“每包实际承载流内半开区间”全部可复算',
+        r.commands.every((c, i) => sameJson(c.sources, spec.commands[i].sources)),
+        JSON.stringify(r.commands.map((c) => c.sources)));
+      ok('冒烟: good 每个原始包的实际承载区间审计表一致',
+        sameJson(r.packetCoverage, spec.packetCoverage),
+        JSON.stringify(r.packetCoverage));
+      // 重叠分片 #10 与原分片 #11/#16 必须同时保留对 [24,36) 的凭据
+      const overlapCmd = r.commands[2];
+      const byPkt = Object.fromEntries(overlapCmd.sources.map((s) => [s.packet, s.ranges]));
+      ok('冒烟: good 相同内容重叠分片保留两份原始包凭据',
+        sameJson(byPkt[10], [[24, 36]]) && sameJson(byPkt[11], [[24, 28]])
+          && sameJson(byPkt[16], [[28, 36]]),
+        JSON.stringify(byPkt));
+      ok('冒烟: good SYN/FIN/流长度/包号汇总',
+        r.synPacket === spec.synPacket && r.finPacket === spec.finPacket
+        && r.streamLength === spec.streamLength && r.packetCount === spec.packetCount,
+        `${r.synPacket}/${r.finPacket}/${r.streamLength}/${r.packetCount}`);
+    }
+
+    // conflict 与 fragconflict：必须拒绝并给出首个冲突包号/偏移/半开区间
+    for (const kind of ['conflict', 'fragconflict']) {
+      const spec = manifest[kind];
+      try {
+        await analyzeFromHttp(spec);
+        ok(`冒烟: ${kind} 样例必须拒绝`, false);
+      } catch (e) {
+        ok(`冒烟: ${kind} 样例冲突定位符合`,
+          e.code === spec.code && e.packet === spec.packet && e.packet2 === spec.packet2
+          && e.offset === spec.offset && JSON.stringify(e.range) === JSON.stringify(spec.range),
+          `${e.code} ${e.packet}/${e.packet2}@${e.offset} ${JSON.stringify(e.range)}`);
       }
     }
   } catch (e) {

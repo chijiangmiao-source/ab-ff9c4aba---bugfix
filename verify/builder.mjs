@@ -156,6 +156,19 @@ export function makeSession({
       const seg = tcp({ sport, dport, seq: s.seq, flags: 0x18, data: s.data });
       return fragmentPayload({ srcIp, dstIp, id: fragId, payload: seg, chunkSize });
     },
+    // 指定流区间对应的裸 TCP 段（便于手工切出跨片重叠的 IP 分片）
+    tcpSegment: (rel, len, opts = {}) => {
+      const s = segAt(rel, len);
+      return tcp({
+        sport, dport,
+        seq: opts.seq ?? s.seq,
+        flags: opts.flags ?? 0x18,
+        data: opts.data ?? s.data,
+      });
+    },
+    // 本组 IP 标识下的单个分片（part 为 IP 载荷切片，offset 以 8 字节为单位）
+    ipFrag: (part, offset, mf = true, { fragId = id, badChecksum = false } = {}) =>
+      ipFragment({ srcIp, dstIp, id: fragId, part, offset, mf, badChecksum }),
     data: (rel, len, opts = {}) => {
       const s = segAt(rel, len);
       const data = opts.data ?? s.data;
