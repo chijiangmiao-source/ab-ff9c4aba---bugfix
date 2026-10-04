@@ -47,7 +47,12 @@ function renderError(err) {
 }
 
 function renderOk(r) {
-  const rows = r.commands.map((c) => `
+  const rows = r.commands.map((c) => {
+    // 逐包审计：每个原始包实际承载的流内半开区间（相同内容的重叠分片/重传段全部留痕）
+    const carriers = c.packetRanges
+      .map((e) => `#${e.packet} ${e.ranges.map(([a, b]) => `[${a}, ${b})`).join(' ')}`)
+      .join('<br>');
+    return `
     <tr>
       <td class="mono">${c.index + 1}</td>
       <td class="mono cmd-text">${esc(c.text)}</td>
@@ -55,7 +60,9 @@ function renderOk(r) {
       <td class="mono">[${c.byteRange[0]}, ${c.byteRange[1]})</td>
       <td class="mono">[${c.payloadRange[0]}, ${c.payloadRange[1]})</td>
       <td class="mono pkt-list">${c.packets.map((p) => `#${p}`).join(', ')}</td>
-    </tr>`).join('');
+      <td class="mono pkt-list">${carriers}</td>
+    </tr>`;
+  }).join('');
   resultEl.innerHTML = `
     <div class="banner ok">
       <div>✓ 复核通过：已按序重建 ${r.commands.length} 条长度前缀 ASCII 指令（FIN 前连续字节，无空洞、无冲突）</div>
@@ -73,6 +80,7 @@ function renderOk(r) {
           <th class="mono">流内字节区间[起,止)<br><span style="font-weight:400">含 2 字节长度前缀</span></th>
           <th class="mono">载荷区间[起,止)</th>
           <th>对应原始包号</th>
+          <th class="mono">各包实际承载的流内区间[起,止)<br><span style="font-weight:400">重叠分片/重传段全部留痕</span></th>
         </tr>
       </thead>
       <tbody>${rows}</tbody>

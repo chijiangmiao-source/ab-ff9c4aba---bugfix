@@ -118,6 +118,61 @@ const req = (buf, extra = {}) => ({ ...T, pcapBase64: b64(buf), ...extra });
     () => analyze(req(pcap([s.syn(), ...frags, evil, s.fin(18)]))), 'FRAGMENT_CONFLICT');
 }
 
+// ---------- 4d. 分片逐字节承载审计：乱序 / 相同内容重叠 / 冲突定位 ----------
+{
+  // 三条指令，TCP 数据报跨 6 个 IPv4 分片且乱序到达
+  const s = makeSession({ commands: ['ALPHA', 'BRAVO!', 'CHARLIE'] }); // 帧长 7+8+9 = 24
+  const seg = tcp({ sport: s.sport, dport: s.dport, seq: s.dataStart, flags: 0x18, data: s.stream });
+  const frags = fragmentPayload({ srcIp: s.srcIp, dstIp: s.dstIp, id: 0x7100, payload: seg, chunkSize: 8 });
+  eq('审计: 44 字节数据报切成 6 片', frags.length, 6);
+  // 到达顺序打乱：SYN=#1，分片=#2..#7，FIN=#8
+  //   #7=frag2(流[0,4))  #6=frag3(流[4,12))  #2=frag4(流[12,20))  #4=frag5(流[20,24))
+  const shuffled = [frags[4], frags[1], frags[5], frags[0], frags[3], frags[2]];
+  const r = analyze(req(pcap([s.syn(), ...shuffled, s.fin(24)])));
+  eq('审计: 乱序分片下指令文本', r.commands.map((c) => c.text), ['ALPHA', 'BRAVO!', 'CHARLIE']);
+  eq('审计: 指令流内区间', r.commands.map((c) => c.byteRange), [[0, 7], [7, 15], [15, 24]]);
+  eq('审计: 载荷区间', r.commands.map((c) => c.payloadRange), [[2, 7], [9, 15], [17, 24]]);
+  // 前缀、载荷与后续指令分别归属到真实覆盖它们的分片包
+  eq('审计: 指令一各包承载区间', r.commands[0].packetRanges,
+    [{ packet: 7, ranges: [[0, 4]] }, { packet: 6, ranges: [[4, 7]] }]);
+  eq('审计: 指令二各包承载区间', r.commands[1].packetRanges,
+    [{ packet: 6, ranges: [[7, 12]] }, { packet: 2, ranges: [[12, 15]] }]);
+  eq('审计: 指令三各包承载区间', r.commands[2].packetRanges,
+    [{ packet: 2, ranges: [[15, 20]] }, { packet: 4, ranges: [[20, 24]] }]);
+
+  // 加入与已有分片重叠但内容完全相同的有效分片：结论仍通过，
+  // 且重叠区间的两份原始包（#4/#5 与 #8）都保留为审计依据
+  const dup = ipFragment({
+    srcIp: s.srcIp, dstIp: s.dstIp, id: 0x7100,
+    part: seg.subarray(16, 32), offset: 2, mf: true, // 覆盖流 [0,12)，与 frag2/frag3 完全重叠
+  });
+  const r2 = analyze(req(pcap([s.syn(), ...frags, dup, s.fin(24)])));
+  eq('审计: 相同内容重叠分片仍通过', r2.commands.map((c) => c.text), ['ALPHA', 'BRAVO!', 'CHARLIE']);
+  eq('审计: 重叠分片双包留痕（指令一）', r2.commands[0].packetRanges,
+    [{ packet: 4, ranges: [[0, 4]] }, { packet: 8, ranges: [[0, 7]] },
+      { packet: 5, ranges: [[4, 7]] }]);
+  eq('审计: 重叠分片双包留痕（指令二）', r2.commands[1].packetRanges,
+    [{ packet: 5, ranges: [[7, 12]] }, { packet: 8, ranges: [[7, 12]] },
+      { packet: 6, ranges: [[12, 15]] }]);
+  eq('审计: 未被重叠的指令三不受影响', r2.commands[2].packetRanges,
+    [{ packet: 6, ranges: [[15, 20]] }, { packet: 7, ranges: [[20, 24]] }]);
+  eq('审计: 指令一包号集合含重叠双方', r2.commands[0].packets, [4, 5, 8]);
+
+  // 重叠分片字节不同：必须 FRAGMENT_CONFLICT 并定位首个违规位置
+  const evilPart = Buffer.from(seg.subarray(24, 32)); // IP 载荷 [24,32)，含流 [4,12)
+  evilPart[0] ^= 0x5a;                                 // 数据报偏移 24 处字节被改
+  const evil = ipFragment({ srcIp: s.srcIp, dstIp: s.dstIp, id: 0x7100, part: evilPart, offset: 3, mf: true });
+  try {
+    analyze(req(pcap([s.syn(), ...frags, evil, s.fin(24)])));
+    ok('审计: 冲突分片拒绝', false);
+  } catch (e) {
+    ok('审计: 冲突分片拒绝', e.code === 'FRAGMENT_CONFLICT', e.message);
+    eq('审计: 冲突定位首个包号对', [e.packet, e.packet2], [5, 8]);
+    eq('审计: 冲突定位数据报偏移', e.offset, 24);
+    eq('审计: 冲突半开区间', e.range, [24, 25]);
+  }
+}
+
 // ---------- 4b. VLAN / IP-TCP 选项 / 以太网填充 ----------
 {
   const s = makeSession({ commands: ['VL','OPTS','PAD'] }); // 帧长 4+6+5 = 15
@@ -324,6 +379,10 @@ const req = (buf, extra = {}) => ({ ...T, pcapBase64: b64(buf), ...extra });
   eq('结构: 第二条载荷区间', r.commands[1].payloadRange, [11, 19]);
   eq('结构: 两条指令的承载包号集合',
     [...new Set(r.commands.flatMap((c) => c.packets))].sort((a, b) => a - b), [3, 4]);
+  eq('结构: 第一条各包承载区间', r.commands[0].packetRanges,
+    [{ packet: 3, ranges: [[0, 9]] }]);
+  eq('结构: 第二条各包承载区间（重传段双包留痕）', r.commands[1].packetRanges,
+    [{ packet: 3, ranges: [[9, 11]] }, { packet: 4, ranges: [[9, 19]] }]);
   eq('结构: 流长度', r.streamLength, 19);
 }
 
@@ -342,7 +401,7 @@ const req = (buf, extra = {}) => ({ ...T, pcapBase64: b64(buf), ...extra });
   }
   // 页面与同构库必须是语法合法的 ESM（node --check）
   for (const f of ['public/app.js', 'lib/analyze.js', 'lib/tcp.js', 'lib/ipdefrag.js',
-    'lib/decode.js', 'lib/commands.js', 'lib/base64.js', 'src/server.js']) {
+    'lib/decode.js', 'lib/commands.js', 'lib/base64.js', 'lib/origin.js', 'src/server.js']) {
     try {
       execFileSync(process.execPath, ['--check', path.join(ROOT, f)], { stdio: 'pipe' });
       ok(`页面: ESM 语法检查 ${f}`, true);
@@ -415,6 +474,12 @@ const req = (buf, extra = {}) => ({ ...T, pcapBase64: b64(buf), ...extra });
           && r.streamLength === spec.streamLength && r.packetCount === spec.packetCount;
         ok('冒烟: good 样例指令/包号/长度全部符合', smokeOk === 1,
           JSON.stringify(r.commands.map((c) => c.text)));
+        // 逐包审计：每条指令的各原始包实际承载流内半开区间须与清单一致
+        // （含内容完全相同的重叠分片 #8/#9 与同字节重传段 #11/#13 的双包留痕）
+        const rangesOk = r.commands.every((c, i) =>
+          JSON.stringify(c.packetRanges) === JSON.stringify(spec.packetRanges[i]));
+        ok('冒烟: good 样例逐包承载区间符合审计清单', rangesOk,
+          JSON.stringify(r.commands.map((c) => c.packetRanges)));
       } else {
         try {
           analyze(input);
